@@ -3,7 +3,7 @@ name: Android build
 on:
   push:
     branches: [ main ]
-  pull_request:
+  workflow_dispatch:
 
 jobs:
   build:
@@ -14,7 +14,12 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      - uses: gradle/actions/setup-gradle@v4
+      - name: Install Gradle
+        run: sudo apt-get update && sudo apt-get install -y gradle
+      - name: Build debug APK
+        run: gradle :app:assembleDebug --no-daemon
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
         with:
-          gradle-version: '8.7'
-      - run: gradle assembleDebug
+          name: VolgaVPN-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
