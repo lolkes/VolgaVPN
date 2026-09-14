@@ -1,9 +1,10 @@
-*.iml
 .gradle/
 .idea/
+/build/
+*/build/
 local.properties
+*.iml
 .DS_Store
-build/
-app/build/
-.externalNativeBuild/
-.cxx/
+server/*.conf
+server/*.key
+server/*.pub
