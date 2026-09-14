@@ -5,145 +5,195 @@ import android.content.Intent
 import android.graphics.Color
 import android.net.VpnService
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
-import android.view.Gravity
-import android.view.View
 import android.widget.*
-import java.util.Locale
+import com.wireguard.android.backend.BackendException
+import com.wireguard.android.backend.GoBackend
+import com.wireguard.android.backend.Tunnel
+import com.wireguard.config.Config
+import java.io.ByteArrayInputStream
+import java.net.HttpURLConnection
+import java.net.URL
+import java.nio.charset.StandardCharsets
+import java.util.concurrent.Executors
 
 class MainActivity : Activity() {
+    private val executor = Executors.newSingleThreadExecutor()
     private val prefs by lazy { getSharedPreferences("volga", MODE_PRIVATE) }
-    private val handler = Handler(Looper.getMainLooper())
-    private var connected = false
-    private var startedAt = 0L
+    private val tunnel = AppTunnel("volga")
+    private val backend by lazy { GoBackend(applicationContext) }
     private lateinit var status: TextView
-    private lateinit var timer: TextView
+    private lateinit var ip: TextView
     private lateinit var button: Button
-    private lateinit var server: Spinner
-
-    private val servers = listOf("🇳🇱  Netherlands", "🇩🇪  Germany", "🇫🇮  Finland")
-    private val tick = object : Runnable {
-        override fun run() {
-            if (connected) {
-                val seconds = ((System.currentTimeMillis() - startedAt) / 1000).toInt()
-                timer.text = String.format(Locale.US, "%02d:%02d:%02d", seconds / 3600, (seconds / 60) % 60, seconds % 60)
-                handler.postDelayed(this, 1000)
-            }
-        }
-    }
+    private lateinit var configBox: EditText
+    private var pendingConnect = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        window.statusBarColor = Color.rgb(8, 17, 31)
-        window.navigationBarColor = Color.rgb(8, 17, 31)
+        window.statusBarColor = Color.rgb(7, 16, 29)
+        window.navigationBarColor = Color.rgb(7, 16, 29)
         buildUi()
+        configBox.setText(prefs.getString("config", "") ?: "")
+        refreshIp()
     }
 
     private fun buildUi() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(22), dp(24), dp(22), dp(18))
-            setBackgroundColor(Color.rgb(8, 17, 31))
+            setPadding(40, 55, 40, 30)
+            setBackgroundColor(Color.rgb(7, 16, 29))
+        }
+        fun tv(text: String, size: Float, color: Int = Color.WHITE) = TextView(this).apply {
+            this.text = text
+            textSize = size
+            setTextColor(color)
         }
 
-        val scroll = ScrollView(this).apply { addView(root) }
-        setContentView(scroll)
-
-        val header = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
-        val logo = TextView(this).apply { text = "🛡"; textSize = 28f }
-        val brand = TextView(this).apply { text = "VOLGAVPN\nPRIVATE NETWORK"; textSize = 17f; setTextColor(Color.WHITE); setPadding(dp(12),0,0,0) }
-        header.addView(logo)
-        header.addView(brand)
-        root.addView(header)
-
-        root.addView(space(26))
-        root.addView(text("SECURE CONNECTION", 11f, Color.rgb(73,215,255)))
-        status = text("NOT CONNECTED", 28f, Color.WHITE).apply { setPadding(0, dp(6), 0, 0) }
+        root.addView(tv("VOLGAVPN", 30f))
+        root.addView(tv("FREE WIREGUARD CLIENT", 11f, Color.CYAN))
+        status = tv("● НЕ ПОДКЛЮЧЕНО", 20f).apply { setPadding(0, 45, 0, 8) }
+        ip = tv("Внешний IP: проверка...", 14f, Color.LTGRAY)
         root.addView(status)
-        timer = text("00:00:00", 14f, Color.LTGRAY).apply { setPadding(0, dp(4),0,0) }
-        root.addView(timer)
+        root.addView(ip)
 
-        root.addView(space(20))
-        val connect = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(18), dp(18), dp(18), dp(18)); setBackgroundColor(Color.rgb(13, 28, 47)) }
-        connect.addView(text("LOCATION", 10f, Color.GRAY))
-        server = Spinner(this).apply {
-            adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, servers)
-            setSelection(prefs.getInt("server", 0))
-        }
-        connect.addView(server, LinearLayout.LayoutParams(-1, dp(52)))
-        root.addView(connect)
+        root.addView(Button(this).apply {
+            text = "ИМПОРТИРОВАТЬ .CONF"
+            setOnClickListener { openConfigFile() }
+        })
 
-        root.addView(space(18))
-        button = Button(this).apply {
-            text = "CONNECT"
-            textSize = 16f
-            isAllCaps = true
+        configBox = EditText(this).apply {
+            hint = "Или вставь сюда WireGuard-конфигурацию"
+            hintTextColor = Color.GRAY
             setTextColor(Color.WHITE)
-            setBackgroundColor(Color.rgb(24, 105, 145))
-            setOnClickListener { toggleVpn() }
+            setBackgroundColor(Color.rgb(15, 27, 43))
+            minLines = 7
+            gravity = android.view.Gravity.TOP
+            setPadding(18, 15, 18, 15)
         }
-        root.addView(button, LinearLayout.LayoutParams(-1, dp(58)))
+        root.addView(configBox, LinearLayout.LayoutParams(-1, 0, 1f).apply { topMargin = 12 })
 
-        root.addView(space(18))
-        root.addView(statCard("VPN PROTOCOL", "WireGuard-ready architecture"))
-        root.addView(statCard("DNS", "1.1.1.1"))
-        root.addView(statCard("STATUS", "Local VPN service available"))
+        button = Button(this).apply {
+            text = "ПОДКЛЮЧИТЬСЯ"
+            textSize = 17f
+            setOnClickListener { toggle() }
+        }
+        root.addView(button)
 
-        root.addView(space(16))
-        val note = text("The current build contains the Android VPN service foundation. A real public-IP tunnel requires a provisioned VPN server and protocol configuration; private keys are intentionally not embedded.", 12f, Color.rgb(165, 178, 192))
-        note.setPadding(dp(4), dp(8), dp(4), dp(8))
-        root.addView(note)
+        root.addView(Button(this).apply {
+            text = "СОХРАНИТЬ КОНФИГ"
+            setOnClickListener {
+                prefs.edit().putString("config", configBox.text.toString()).apply()
+                toast("Конфигурация сохранена")
+            }
+        })
+        root.addView(tv("Используется настоящий WireGuard userspace backend. Сервер и ключи не вшиваются в приложение.", 11f, Color.GRAY))
+        setContentView(root)
     }
 
-    private fun toggleVpn() {
-        if (connected) {
-            stopService(Intent(this, VolgaVpnService::class.java))
-            connected = false
-            status.text = "NOT CONNECTED"
-            button.text = "CONNECT"
-            handler.removeCallbacks(tick)
-            return
-        }
-
-        prefs.edit().putInt("server", server.selectedItemPosition).apply()
-        val intent = VpnService.prepare(this)
-        if (intent != null) {
-            startActivityForResult(intent, REQUEST_VPN)
-            return
-        }
-        startVpnService()
+    private fun openConfigFile() {
+        startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            type = "text/plain"
+            addCategory(Intent.CATEGORY_OPENABLE)
+        }, REQUEST_FILE)
     }
 
-    private fun startVpnService() {
-        val serviceIntent = Intent(this, VolgaVpnService::class.java)
-        if (android.os.Build.VERSION.SDK_INT >= 26) startForegroundService(serviceIntent) else startService(serviceIntent)
-        connected = true
-        startedAt = System.currentTimeMillis()
-        status.text = "VPN ENGINE ACTIVE"
-        button.text = "DISCONNECT"
-        handler.post(tick)
+    private fun toggle() {
+        try {
+            if (backend.getState(tunnel) == Tunnel.State.UP) disconnect() else connect()
+        } catch (e: Exception) {
+            toast("Не удалось получить состояние VPN: ${e.message}")
+        }
+    }
+
+    private fun connect() {
+        val text = configBox.text.toString().trim()
+        if (text.isEmpty()) {
+            toast("Сначала импортируй WireGuard .conf")
+            return
+        }
+        val permission = VpnService.prepare(this)
+        if (permission != null) {
+            pendingConnect = true
+            startActivityForResult(permission, REQUEST_VPN)
+            return
+        }
+        startTunnel(text)
+    }
+
+    private fun startTunnel(text: String) {
+        executor.execute {
+            try {
+                val config = Config.parse(ByteArrayInputStream(text.toByteArray(StandardCharsets.UTF_8)))
+                backend.setState(tunnel, Tunnel.State.UP, config)
+                runOnUiThread {
+                    pendingConnect = false
+                    status.text = "● ПОДКЛЮЧЕНО"
+                    status.setTextColor(Color.CYAN)
+                    button.text = "ОТКЛЮЧИТЬСЯ"
+                    refreshIp()
+                }
+            } catch (e: BackendException) {
+                showError("VPN: ${e.reason}")
+            } catch (e: Exception) {
+                showError("Ошибка: ${e.message ?: "неизвестная ошибка"}")
+            }
+        }
+    }
+
+    private fun disconnect() {
+        executor.execute {
+            try { backend.setState(tunnel, Tunnel.State.DOWN, null) }
+            catch (_: Exception) { }
+            runOnUiThread {
+                status.text = "● НЕ ПОДКЛЮЧЕНО"
+                status.setTextColor(Color.WHITE)
+                button.text = "ПОДКЛЮЧИТЬСЯ"
+                refreshIp()
+            }
+        }
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == REQUEST_VPN && resultCode == RESULT_OK) startVpnService()
+        if (requestCode == REQUEST_FILE && resultCode == RESULT_OK) {
+            data?.data?.let { uri ->
+                contentResolver.openInputStream(uri)?.use {
+                    configBox.setText(it.readBytes().toString(StandardCharsets.UTF_8))
+                }
+            }
+        } else if (requestCode == REQUEST_VPN && resultCode == RESULT_OK && pendingConnect) {
+            startTunnel(configBox.text.toString().trim())
+        }
     }
 
-    override fun onDestroy() {
-        handler.removeCallbacks(tick)
-        super.onDestroy()
+    private fun refreshIp() {
+        executor.execute {
+            val result = try {
+                (URL("https://api.ipify.org").openConnection() as HttpURLConnection).run {
+                    connectTimeout = 5000
+                    readTimeout = 5000
+                    inputStream.bufferedReader().use { it.readText() }
+                }
+            } catch (_: Exception) { "—" }
+            runOnUiThread { ip.text = "Внешний IP: $result" }
+        }
     }
 
-    private fun text(value: String, size: Float, color: Int) = TextView(this).apply { text = value; textSize = size; setTextColor(color) }
-    private fun space(h: Int) = Space(this).apply { layoutParams = LinearLayout.LayoutParams(1, dp(h)) }
-    private fun statCard(title: String, value: String) = LinearLayout(this).apply {
-        orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; setPadding(dp(16), dp(14), dp(16), dp(14)); setBackgroundColor(Color.rgb(13, 28, 47))
-        val a = text(title, 10f, Color.GRAY); val b = text(value, 13f, Color.WHITE); b.gravity = Gravity.RIGHT
-        addView(a, LinearLayout.LayoutParams(0, dp(46), 1f)); addView(b, LinearLayout.LayoutParams(0, dp(46), 1f))
-        layoutParams = LinearLayout.LayoutParams(-1, dp(74)).apply { bottomMargin = dp(8) }
+    private fun showError(message: String) = runOnUiThread {
+        toast(message)
+        status.text = "● ОШИБКА"
+        status.setTextColor(Color.RED)
     }
-    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
-    companion object { private const val REQUEST_VPN = 501 }
+    private fun toast(message: String) = Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+    override fun onDestroy() { executor.shutdownNow(); super.onDestroy() }
+
+    private class AppTunnel(private val name: String) : Tunnel {
+        override fun getName() = name
+        override fun onStateChange(newState: Tunnel.State) { }
+    }
+
+    companion object {
+        private const val REQUEST_FILE = 100
+        private const val REQUEST_VPN = 101
+    }
 }
